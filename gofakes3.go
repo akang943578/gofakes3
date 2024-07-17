@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +44,7 @@ type GoFakeS3 struct {
 
 	// simple v4 signature
 	v4AuthPair map[string]string
+	mu         sync.RWMutex
 }
 
 // New creates a new GoFakeS3 using the supplied Backend. Backends are pluggable.
@@ -99,6 +102,8 @@ func (g *GoFakeS3) Server() http.Handler {
 }
 
 func (g *GoFakeS3) AddAuthKeys(p map[string]string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	for k, v := range p {
 		g.v4AuthPair[k] = v
 	}
@@ -106,6 +111,8 @@ func (g *GoFakeS3) AddAuthKeys(p map[string]string) {
 }
 
 func (g *GoFakeS3) DelAuthKeys(p []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	for _, v := range p {
 		delete(g.v4AuthPair, v)
 	}
@@ -114,6 +121,8 @@ func (g *GoFakeS3) DelAuthKeys(p []string) {
 
 func (g *GoFakeS3) authMiddleware(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, rq *http.Request) {
+		g.mu.RLock()
+		defer g.mu.RUnlock()
 		if len(g.v4AuthPair) > 0 {
 			result := signature.V4SignVerify(rq)
 
@@ -238,6 +247,31 @@ func (g *GoFakeS3) listBucket(bucketName string, w http.ResponseWriter, r *http.
 
 	ctx := r.Context()
 	objects, err := g.storage.ListBucket(ctx, bucketName, &prefix, page)
+	log.Debugf("objects.Contents: %v, prefix: %v", objects.Contents, prefix)
+
+	hasPrefixSelf := false
+	if objects.Contents != nil {
+		for _, v := range objects.Contents {
+			if v.Key == prefix.Prefix {
+				hasPrefixSelf = true
+				break
+			}
+		}
+	}
+
+	if !hasPrefixSelf {
+		log.Infof("objects.Contents not has prefix self, need to add it.")
+		objects.Contents = append(objects.Contents, &Content{
+			Key:          prefix.Prefix,
+			LastModified: NewContentTime(time.Time{}),
+			ETag:         "",
+			Size:         0,
+			StorageClass: StorageStandard,
+			Owner:        nil,
+		})
+	}
+	log.Debugf("objects.Contents: %v", objects.Contents)
+
 	if err != nil {
 		if err == ErrInternalPageNotImplemented && !g.failOnUnimplementedPage {
 			// We have observed (though not yet confirmed) that simple clients
